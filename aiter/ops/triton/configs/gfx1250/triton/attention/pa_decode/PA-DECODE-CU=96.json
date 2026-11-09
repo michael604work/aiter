@@ -9,7 +9,7 @@
     },
     "launch": {
         "v1_w_dot": {
-            "any": {"num_warps": 4, "num_stages": 1, "waves_per_eu": 3}
+            "any": {"num_warps": 4, "num_stages": 1, "waves_per_eu": 3, "USE_TENSOR_DESC": true}
         }
     }
 }
