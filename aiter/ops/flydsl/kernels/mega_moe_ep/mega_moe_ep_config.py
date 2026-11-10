@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import functools
 import math
-import os
 
 import flydsl.expr as fx
 
@@ -215,7 +214,7 @@ assert EPOCH_SLOT < XMAP < QCNT
 # order, and a GEMM1 tile waits its expert's count.
 # The up-front rounds are picked per launch from m: OVG0_HI at m >= OVG0_MIN, else
 # OVG0_LO.
-# Owner-split senders (non-SDMA): sender CTA b sends only owner b % npes's rounds, so a
+# Owner-split senders: sender CTA b sends only owner b % npes's rounds, so a
 # destination whose ingress a hot round saturates no longer holds back the other owners'
 # later rounds.  Owners taking over HVT % of a strided token sample's round-0 sends --
 # except the sample's most-loaded owner -- skip the up-front rounds (they would stall
@@ -234,35 +233,6 @@ XHOT_LARGE = 4
 # [SBX_SCNT, SBX_SCNT + MAX_NPES): SBX payload senders to owner d done (self-resetting;
 # the MAGG slots, unused by SBX)
 SBX_SCNT = MAGG_X
-
-# AITER_MEGAMOE_EP_SDMA=1 (large kernel, experimental, default off): the payload rounds go
-# by MORI device SDMA.
-# Every sender packs round g's rows per owner p contiguously at the compacted row
-# off(p, g) + pos (pos from per-(p, g) counters, then a grid barrier), into its own
-# arena's stage region (p == rank: straight into its payload); the round's last CTA posts
-# one put per (owner, payload / scale) and the owner waits the per-(source, queue)
-# signal counts instead of FLAG_PAYC.  The owner finds a row through recv_pos.  The
-# extra counting pass and grid barrier cost small batches.
-SDMA_ENV = int(os.environ.get("AITER_MEGAMOE_EP_SDMA", "0"))
-SD_QP, SD_QS = 1, 2  # SDMA queues: payload rows, their scales
-SD_GMAX = 8  # >= payload rounds (ceil(EPR / N_XCD))
-# sdst (local int32 tensor) slots
-SD_CNT = 0  # [MAX_NPES * SD_GMAX]: rows per (owner, round) (self-resetting)
-SD_RD = (
-    SD_CNT + MAX_NPES * SD_GMAX
-)  # [SD_GMAX]: CTAs done packing round g (self-resetting)
-SD_TURN = (
-    SD_RD + SD_GMAX
-)  # the next round to post (puts in round order; self-resetting)
-SD_SELF = SD_TURN + 1  # epoch * SD_GMAX + rounds of this rank's own rows written
-SD_LAND = SD_SELF + 1  # epoch * SD_GMAX + rounds some CTA saw landed from every source
-SD_BASE = (
-    SD_SELF + 7
-)  # [MAX_NPES * 2]: this launch's signal base per (source, SD_QP / SD_QS)
-SD_INTS = SD_BASE + 2 * MAX_NPES
-SD_DUM = 64  # bytes per source of the dummy-put target (a round without rows)
-# SDMA: the packing is local, so it takes more up-front rounds and sender CTAs
-SD_NSX, SD_OVG0 = 8, 2
 
 
 def sbx_on(SB):
@@ -296,7 +266,6 @@ C_UROWS, C_USEQ, C_GEXP, C_CNT = 6, 7, 8, 9  # current unit rows / seq / gather 
 C_ELAST = 10  # old value of this CTA's last echunk-counter add (tid0 -> waves)
 C_QIDX = 11  # the tile index tid0 pulled from the XCD queue (tid0 -> waves)
 C_ROT = 14  # the expert-major walk's start group (in echunks from e_lo)
-C_SDL = 12  # SDMA: epoch * SD_GMAX + payload rounds this CTA saw landed (tid0)
 C_UL = 16  # per-CTA unit list base (records of 4 ints: expert_chunk, i0, icnt, kind)
 UL_MAX = (128 - C_UL) // 4
 
@@ -457,14 +426,8 @@ def kernel_config(
     # mt=8 (a4w4): the non-rebased per-echunk offset math spills its K-loop, so it
     # always rebases
     INTER_REBASE = REBASE_AUTO or MT == 8
-    SDMAD = not SB and bool(SDMA_ENV)
-    NSXK = SD_NSX if SDMAD else NSX  # payload sender CTAs per XCD
-    OVG0K = SD_OVG0 if SDMAD else None  # up-front payload rounds (None: by m, OVG0_*)
-    OWS = (
-        not SB and not SDMAD
-    )  # owner-split senders + hot-owner up-front deferral (NSX)
-    assert not OWS or NSXK * N_XCD >= MAX_NPES
-    assert not SDMAD or ceildiv(EPR, N_XCD) <= SD_GMAX
+    OWS = not SB  # owner-split senders + hot-owner up-front deferral (NSX)
+    assert not OWS or NSX * N_XCD >= MAX_NPES
     XHOT = 0 if SB else XHOT_LARGE
     # Large kernel: per-(local expert, token bucket) payload readiness.  Every payload
     # round goes in PB token buckets (bucket j: the source's tokens [j m / PB,
@@ -482,7 +445,6 @@ def kernel_config(
     PBSG = 4
     assert not PB or (
         XHOT
-        and not SDMAD
         and EPR * PB <= NCTA_MAX
         and PB <= N_XCD
         and PB & (PB - 1) == 0
@@ -518,6 +480,5 @@ def kernel_config(
         + ("_wnt" if WNT else "")
         + ("_rb" if INTER_REBASE and not REBASE_AUTO else "")
         + (f"_lim{swiglu_limit:g}" if math.isfinite(swiglu_limit) else "")
-        + ("_sdma" if SDMAD else "")
     )
     return KernelCtx(**locals(), NW=NW, NT=NT, NTT=NTT, TILE_N=TILE_N)

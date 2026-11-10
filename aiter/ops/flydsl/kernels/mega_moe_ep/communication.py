@@ -49,7 +49,6 @@ from .common import (
     wait_vm,
 )
 from .mega_moe_ep_config import (
-    C_SDL,
     CTRL_ERR,
     ERR_COMBINE,
     ERR_COMPUTE,
@@ -75,16 +74,6 @@ from .mega_moe_ep_config import (
     NCTA_MAX,
     SBX_SCNT,
     SBX_TB,
-    SD_BASE,
-    SD_CNT,
-    SD_DUM,
-    SD_GMAX,
-    SD_LAND,
-    SD_QP,
-    SD_QS,
-    SD_RD,
-    SD_SELF,
-    SD_TURN,
     KernelCtx,
 )
 
@@ -199,13 +188,8 @@ def build_communication(kc: KernelCtx) -> dict:
     # n-tiles landed.
     COMB_W = H // kc.get("TILE_N2")[0]
     SBXP = kc.get("SBXP")[0]
-    SDMAD = kc.get("SDMAD")[0]
     OWS = kc.get("OWS")[0]
     PB, PBK, PBT = kc.get("PB PBK PBT")
-    if SDMAD:
-        from .sdma import sdma_externs
-
-        sd_put, sd_slot = sdma_externs()
 
     # --- arena addressing --------------------------------------------------------
     def ctrl_at(a, idx):
@@ -406,227 +390,6 @@ def build_communication(kc: KernelCtx) -> dict:
     assert EPR <= NCTA_MAX  # FLAG_PAYC: one counter per local expert per parity
     assert (OVL_LIST + NT * min(MAX_NPES, TOPK)) * 4 <= 16 * kc.get("TILE_N")[0] * 4
 
-    def _rounds(a, tc):
-        """Per owner p, the token's earliest round among its experts on p (OVL_LB: none);
-        every expert's rows are then all sent by its own round le % OVL_LB."""
-        epr = a["epr"]
-        rids = rsrc(a["ids"], a["m"] * i32(TOPK) * i32(4))
-        es = [
-            fx.Int32(bld(rids, (tc * i32(TOPK) + i32(r)) * i32(4), 0, T.i32, 0))
-            for r in range(TOPK)
-        ]
-        vs = [(e >= i32(0)) & (e < i32(E)) for e in es]
-        ows = [e // epr for e in es]
-        les = [es[r] - ows[r] * epr for r in range(TOPK)]
-        mns = []
-        for p in range(MAX_NPES):
-            mn = i32(OVL_LB)
-            for r in range(TOPK):
-                rr = les[r] % i32(OVL_LB)
-                mn = (vs[r] & (ows[r] == i32(p)) & (rr < mn)).select(rr, mn)
-            mns.append(mn)
-        return mns
-
-    def sd_at(a, idx):
-        return fx.Int64(a["sdst"]) + fx.Int64(i32(idx) * i32(4))
-
-    SD_NH = MAX_NPES * SD_GMAX
-
-    @flyc.jit
-    def sd_rows(L, tid, a):
-        """SDMA dispatch: the compacted row ``off(p, g) + pos`` of each (token, owner p)
-        pair in this rank's stream to p -- round g = the token's earliest round on p, rows
-        round-major -- to ``spos[t * 8 + p]`` (local; other XCDs' CTAs pack the later rounds,
-        so system-scope) and owner p's ``recv_pos``.  Per-CTA
-        LDS counts take one atomic per (owner, round), then a grid barrier gives the round
-        totals.  All NT threads; the stores drain with dispatch_route_all's."""
-        m, mtpr, rank = a["m"], a["mtpr"], a["rank"]
-        rsp = rsrc(a["spos"])
-        nblk = i32(gpu.grid_dim.x)
-        b = i32(gpu.block_id("x"))
-        t_lo = b * m // nblk
-        t_hi = (b + i32(1)) * m // nblk
-        if tid == i32(0):  # no payload round seen landed yet
-            lds_st(L, L_CTL + i32(C_SDL * 4), a["epoch"] * i32(SD_GMAX))
-        # L_C: [0, NH) this CTA's counts, [NH, 2 NH) its base, [2 NH, 3 NH) off(p, g)
-        for k_ in range(tid, i32(SD_NH), i32(NT)):
-            lds_st(L, L_C + i32(k_) * i32(4), i32(0))
-        gpu.barrier()
-        for r0_ in range(t_lo, t_hi, i32(NT)):
-            t = i32(r0_) + tid
-            if t < t_hi:
-                mns = _rounds(a, t)
-                for p in range_constexpr(MAX_NPES):
-                    if mns[p] < i32(OVL_LB):
-                        pos = lds_atomic_add(
-                            L, L_C + (i32(p * SD_GMAX) + mns[p]) * i32(4), 1, ACQ_REL
-                        )
-                        bst(
-                            (mns[p] << i32(24)) | pos,
-                            rsp,
-                            (t * i32(8) + i32(p)) * i32(4),
-                            0,
-                            AUX_SYS,
-                        )
-                    if mns[p] == i32(OVL_LB):
-                        bst(i32(-1), rsp, (t * i32(8) + i32(p)) * i32(4), 0, AUX_SYS)
-        gpu.barrier()
-        if tid < i32(SD_NH):
-            c = lds_ld_i32(L, L_C + tid * i32(4))
-            if c > i32(0):
-                lds_st(
-                    L,
-                    L_C + (i32(SD_NH) + tid) * i32(4),
-                    g_add_agent(sd_at(a, i32(SD_CNT) + tid), c),
-                )
-        wait_vm(0)
-        gpu.barrier()
-        grid_bar(a, tid)
-        gpu.barrier()
-        if tid < i32(SD_NH):
-            p = tid // i32(SD_GMAX)
-            g = tid - p * i32(SD_GMAX)
-            off = i32(0)
-            for gg in range_constexpr(SD_GMAX - 1):
-                v = g_ld_sys(sd_at(a, p * i32(SD_GMAX) + i32(gg + SD_CNT)))
-                off = off + (i32(gg) < g).select(v, i32(0))
-            lds_st(L, L_C + (i32(2 * SD_NH) + tid) * i32(4), off)
-        gpu.barrier()
-        r_rpos = [peer_rs(a, i32(p), "off_rpos") for p in range(MAX_NPES)]
-        for r0_ in range(t_lo, t_hi, i32(NT)):
-            t = i32(r0_) + tid
-            if t < t_hi:
-                for p in range_constexpr(MAX_NPES):
-                    w = fx.Int32(
-                        bld(rsp, (t * i32(8) + i32(p)) * i32(4), 0, T.i32, AUX_SYS)
-                    )
-                    if w >= i32(0):
-                        k = i32(p * SD_GMAX) + w.shrui(i32(24))
-                        row = (
-                            lds_ld_i32(L, L_C + (i32(2 * SD_NH) + k) * i32(4))
-                            + lds_ld_i32(L, L_C + (i32(SD_NH) + k) * i32(4))
-                            + (w & i32(0xFFFFFF))
-                        )
-                        bst(row, rsp, (t * i32(8) + i32(p)) * i32(4), 0, AUX_SYS)
-                        bst(row, r_rpos[p], (rank * mtpr + t) * i32(4), 0, AUX_SYS)
-        gpu.barrier()
-
-    @flyc.jit
-    def sd_post(L, tid, a, g):
-        """The last CTA done packing round g (all its threads): in round order, one put per
-        owner of the round's rows and one of their scales (a 16-B dummy put if the round
-        has none: the owner counts puts), then marks this rank's own rows of the round.
-        """
-        rank, mtpr = a["rank"], a["mtpr"]
-        if tid == i32(0):
-            spin_sys_ge(sd_at(a, SD_TURN), g, a, ERR_DISPATCH)
-        gpu.barrier()
-        if (tid < a["npes"]) & (tid != rank):
-            p = tid
-            off = i32(0)
-            for gg in range_constexpr(SD_GMAX - 1):
-                v = g_ld_sys(sd_at(a, p * i32(SD_GMAX) + i32(gg + SD_CNT)))
-                off = off + (i32(gg) < g).select(v, i32(0))
-            cnt = g_ld_sys(sd_at(a, p * i32(SD_GMAX) + g + i32(SD_CNT)))
-            pb = peer_sel(a, p)
-            mine = a["mine"]
-            if cnt > i32(0):
-                srow = fx.Int64(p * mtpr + off)
-                drow = fx.Int64(rank * mtpr + off)
-                sd_put(
-                    a["dc"],
-                    p,
-                    pb + fx.Int64(a["off_payload"]) + drow * fx.Int64(ROW_BYTES),
-                    mine + fx.Int64(a["off_stage"]) + srow * fx.Int64(ROW_BYTES),
-                    fx.Int64(cnt) * fx.Int64(ROW_BYTES),
-                    i32(SD_QP),
-                )
-                sd_put(
-                    a["dc"],
-                    p,
-                    pb + fx.Int64(a["off_pscale"]) + drow * fx.Int64(SCALE_I32 * 4),
-                    mine + fx.Int64(a["off_sstage"]) + srow * fx.Int64(SCALE_I32 * 4),
-                    fx.Int64(cnt) * fx.Int64(SCALE_I32 * 4),
-                    i32(SD_QS),
-                )
-            if cnt == i32(0):
-                dd = pb + fx.Int64(a["off_sdum"]) + fx.Int64(rank * i32(SD_DUM))
-                sd_put(
-                    a["dc"],
-                    p,
-                    dd,
-                    mine + fx.Int64(a["off_sdum"]),
-                    fx.Int64(16),
-                    i32(SD_QP),
-                )
-                sd_put(
-                    a["dc"],
-                    p,
-                    dd + fx.Int64(32),
-                    mine + fx.Int64(a["off_sdum"]),
-                    fx.Int64(16),
-                    i32(SD_QS),
-                )
-        wait_vm(0)
-        gpu.barrier()
-        if tid == i32(0):
-            g_st_sys(sd_at(a, SD_SELF), a["epoch"] * i32(SD_GMAX) + g + i32(1))
-            if g == i32(OVL_LB - 1):  # every CTA packed every round: re-zero
-                for k in range_constexpr(SD_NH + SD_GMAX):
-                    g_st_sys(sd_at(a, SD_CNT + k), i32(0))
-                g_st_sys(sd_at(a, SD_TURN), i32(0))
-            if g != i32(OVL_LB - 1):
-                g_st_sys(sd_at(a, SD_TURN), g + i32(1))
-
-    @flyc.jit
-    def sd_wait(a, g):
-        """(One thread) every source's payload rounds [0, g] landed here."""
-        rank = a["rank"]
-        for s_ in range_constexpr(MAX_NPES):
-            s = i32(s_)
-            if s < a["npes"]:
-                if s == rank:
-                    spin_sys_ge(
-                        sd_at(a, SD_SELF),
-                        a["epoch"] * i32(SD_GMAX) + g + i32(1),
-                        a,
-                        ERR_DISPATCH,
-                    )
-                if s != rank:
-                    for qi in range_constexpr(2):
-                        tgt = (
-                            g_ld_sys(sd_at(a, i32(SD_BASE + 2 * s_ + qi))) + g + i32(1)
-                        )
-                        spin_sys_ge(
-                            fx.Int64(sd_slot(a["dc"], s, i32((SD_QP, SD_QS)[qi]))),
-                            tgt,
-                            a,
-                            ERR_DISPATCH,
-                        )
-
-    @flyc.jit
-    def sd_wait_c(L, a, g):
-        """(tid0) sd_wait through this CTA's C_SDL and the rank's SD_LAND: a CTA polls the
-        sources only for a round no CTA has seen landed yet."""
-        tag = a["epoch"] * i32(SD_GMAX) + g + i32(1)
-        if before(lds_ld_i32(L, L_CTL + i32(C_SDL * 4)), tag):
-            if before(g_ld_sys(sd_at(a, SD_LAND)), tag):
-                sd_wait(a, g)
-                if before(g_ld_sys(sd_at(a, SD_LAND)), tag):
-                    g_st_sys(sd_at(a, SD_LAND), tag)
-            lds_st(L, L_CTL + i32(C_SDL * 4), tag)
-
-    @flyc.jit
-    def sd_finish(a):
-        """(One thread, the last CTA out) every put of this launch landed; advance the
-        per-(source, queue) signal bases by its OVL_LB puts."""
-        sd_wait(a, i32(OVL_LB - 1))
-        for s_ in range_constexpr(MAX_NPES):
-            if (i32(s_) < a["npes"]) & (i32(s_) != a["rank"]):
-                for qi in range_constexpr(2):
-                    k = SD_BASE + 2 * s_ + qi
-                    g_st_sys(sd_at(a, k), g_ld_sys(sd_at(a, k)) + i32(OVL_LB))
-
     @flyc.jit
     def payload_send_ovl(L, tid, a, s, ns, g_lo, g_hi, po, skip):
         """Sender ``s`` of ``ns`` sends its token slice's payload rows (once per
@@ -645,7 +408,6 @@ def build_communication(kc: KernelCtx) -> dict:
         rxs = rsrc(a["xs"])
         lane = tid % i32(64)
         wv = tid // i32(64)
-        rsp = rsrc(a["spos"])
         t_lo = s * m // ns
         t_hi = (s + i32(1)) * m // ns
         tbs = [(t_lo, t_hi)]
@@ -708,7 +470,7 @@ def build_communication(kc: KernelCtx) -> dict:
                                 L_C + (i32(OVL_LIST) + pos) * i32(4),
                                 t * i32(8) + i32(p),
                             )
-                            for r in range_constexpr(0 if SDMAD else TOPK):
+                            for r in range_constexpr(TOPK):
                                 if vs[r] & (ows[r] == i32(p)):
                                     lds_atomic_add(
                                         L,
@@ -727,7 +489,7 @@ def build_communication(kc: KernelCtx) -> dict:
                     # each wave copies DISP_TB list rows per step, loads first (DISP_TB)
                     for b_ in range(wv * i32(DISP_TB), n, i32(NW * DISP_TB)):
                         b = i32(b_)
-                        ents, rows, scs, rws = [], [], [], []
+                        ents, rows, scs = [], [], []
                         for k in range_constexpr(DISP_TB):
                             ent = lds_ld_i32(
                                 L,
@@ -737,12 +499,6 @@ def build_communication(kc: KernelCtx) -> dict:
                             )
                             tk = ent.shrui(i32(3))
                             ents.append(ent)
-                            if const_expr(
-                                SDMAD
-                            ):  # spos[t * 8 + owner]: the compacted row
-                                rws.append(
-                                    fx.Int32(bld(rsp, ent * i32(4), 0, T.i32, AUX_SYS))
-                                )
                             rows.append(
                                 [
                                     bld(
@@ -780,28 +536,8 @@ def build_communication(kc: KernelCtx) -> dict:
                             if b + i32(k) < n:
                                 source_key = rank * mtpr + ents[k].shrui(i32(3))
                                 owner = ents[k] & i32(7)
-                                if const_expr(
-                                    SDMAD
-                                ):  # own payload, else the owner's stage rows
-                                    source_key = owner * mtpr + rws[k]
-                                    own = owner == rank
-                                    dpay = rsrc(
-                                        a["mine"]
-                                        + own.select(
-                                            fx.Int64(a["off_payload"]),
-                                            fx.Int64(a["off_stage"]),
-                                        )
-                                    )
-                                    dsc = rsrc(
-                                        a["mine"]
-                                        + own.select(
-                                            fx.Int64(a["off_pscale"]),
-                                            fx.Int64(a["off_sstage"]),
-                                        )
-                                    )
-                                else:
-                                    dpay = peer_rs(a, owner, "off_payload")
-                                    dsc = peer_rs(a, owner, "off_pscale")
+                                dpay = peer_rs(a, owner, "off_payload")
+                                dsc = peer_rs(a, owner, "off_pscale")
                                 for j in range_constexpr(NJ):
                                     u = lane + i32(j * 64)
                                     if u < i32(N_VEC):
@@ -828,24 +564,15 @@ def build_communication(kc: KernelCtx) -> dict:
                     gpu.barrier()
                 wait_vm(0)  # this round's rows landed before their routes are counted
                 gpu.barrier()
-                if const_expr(SDMAD):  # the round's last CTA posts it
-                    if tid == i32(0):
-                        old = g_add_agent(sd_at(a, i32(SD_RD) + g), i32(1))
-                        lds_st(L, L_C, (old == ns - i32(1)).select(i32(1), i32(0)))
-                    gpu.barrier()
-                    if lds_ld_i32(L, L_C) == i32(1):
-                        sd_post(L, tid, a, g)
-                    gpu.barrier()
-                else:
-                    for k_ in range(tid, npes * i32(EPR * PBK), i32(NT)):
-                        k = i32(k_)
-                        c = lds_ld_i32(L, L_C + k * i32(4))
-                        if c > i32(0):
-                            p = k // i32(EPR * PBK)
-                            slot = k - p * i32(EPR * PBK)  # (PB: le * PB + bucket)
-                            g_add_agent(peer_flag(a, p, FLAG_PAYC, parity, slot), c)
-                            lds_st(L, L_C + k * i32(4), i32(0))
-                    gpu.barrier()
+                for k_ in range(tid, npes * i32(EPR * PBK), i32(NT)):
+                    k = i32(k_)
+                    c = lds_ld_i32(L, L_C + k * i32(4))
+                    if c > i32(0):
+                        p = k // i32(EPR * PBK)
+                        slot = k - p * i32(EPR * PBK)  # (PB: le * PB + bucket)
+                        g_add_agent(peer_flag(a, p, FLAG_PAYC, parity, slot), c)
+                        lds_st(L, L_C + k * i32(4), i32(0))
+                gpu.barrier()
 
     @flyc.jit
     def payload_hot0(L, tid, a):
@@ -894,22 +621,14 @@ def build_communication(kc: KernelCtx) -> dict:
 
     @flyc.jit
     def payload_wait(a, le, need):
-        """Block until ``need`` routes to local expert ``le`` have their payload (SDMA:
-        until every source's rounds up to le % OVL_LB landed)."""
-        if const_expr(SDMAD):
-            sd_wait(a, le % i32(OVL_LB))
-        else:
-            spin_sys_ge(
-                own_flag(a, FLAG_PAYC, a["epoch"] & i32(1), le), need, a, ERR_DISPATCH
-            )
+        """Block until ``need`` routes to local expert ``le`` have their payload."""
+        spin_sys_ge(
+            own_flag(a, FLAG_PAYC, a["epoch"] & i32(1), le), need, a, ERR_DISPATCH
+        )
 
     def payload_reset(a):
         """Zero this launch parity's FLAG_PAYC (every route has been counted and
-        every waiter has passed).  SDMA: wait the last puts, advance the signal bases.
-        """
-        if const_expr(SDMAD):
-            sd_finish(a)
-            return
+        every waiter has passed)."""
         for e in range_constexpr(EPR * PBK):
             g_st_sys(own_flag(a, FLAG_PAYC, a["epoch"] & i32(1), i32(e)), i32(0))
 

@@ -139,13 +139,6 @@ def compile_mega_moe_ep(
         epr: fx.Int32,
         m: fx.Int32,
         mtpr: fx.Int32,
-        dc: fx.Int64,
-        sdst: fx.Int64,
-        spos: fx.Int64,
-        off_stage: fx.Int64,
-        off_sstage: fx.Int64,
-        off_rpos: fx.Int64,
-        off_sdum: fx.Int64,
     ):
         a = dict(locals())
         # npes / epr / mtpr are the compiled-in NPES / EPR / TMAX // NPES (the host passes
@@ -225,13 +218,6 @@ def compile_mega_moe_ep(
         epr: fx.Int32,
         m: fx.Int32,
         mtpr: fx.Int32,
-        dc: fx.Int64,
-        sdst: fx.Int64,
-        spos: fx.Int64,
-        off_stage: fx.Int64,
-        off_sstage: fx.Int64,
-        off_rpos: fx.Int64,
-        off_sdum: fx.Int64,
         i32_grid: fx.Int32,
         stream: fx.Stream,
     ):

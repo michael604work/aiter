@@ -66,6 +66,7 @@ from .mega_moe_ep_config import (
     GBAR_XG,
     MAX_NPES,
     N_XCD,
+    NSX,
     OVG0_HI,
     OVG0_LO,
     OVG0_MIN,
@@ -112,8 +113,7 @@ def build_schedule(kc: KernelCtx) -> dict:
     dispatch_route_all, payload_send_ovl = kc.get("dispatch_route_all payload_send_ovl")
     payload_hot0 = kc.get("payload_hot0")[0]
     payload_wait, payload_reset = kc.get("payload_wait payload_reset")
-    SDMAD, sd_rows, sd_wait_c = kc.get("SDMAD sd_rows sd_wait_c")
-    NSXK, OVG0K, OWS = kc.get("NSXK OVG0K OWS")
+    OWS = kc.get("OWS")[0]
     report = kc.get("report")[0]
     dispatch_wait_meta = kc.get("dispatch_wait_meta")[0]
     grid_bar = kc.get("grid_bar")[0]
@@ -806,8 +806,6 @@ def build_schedule(kc: KernelCtx) -> dict:
 
     def _ovg0(a):
         """Payload rounds every CTA sends up front (the rest go to the NSX senders)."""
-        if OVG0K is not None:
-            return i32(min(OVG0K, OVL_LB))
         return (a["m"] >= i32(OVG0_MIN)).select(
             i32(min(OVG0_HI, OVL_LB)), i32(min(OVG0_LO, OVL_LB))
         )
@@ -894,7 +892,7 @@ def build_schedule(kc: KernelCtx) -> dict:
             )
         if const_expr(not SBXP):
             # the first NSX CTAs of each XCD send the remaining rounds, then join
-            ns = fx.min(i32(NSXK * N_XCD), nblk)
+            ns = fx.min(i32(NSX * N_XCD), nblk)
             bid = i32(gpu.block_id("x"))
             npes = a["npes"]
             if bid < ns:
@@ -959,9 +957,7 @@ def build_schedule(kc: KernelCtx) -> dict:
             else:
                 if const_expr(not SBXP):
                     if tid == i32(0):
-                        if const_expr(SDMAD):
-                            sd_wait_c(L, a, expert % i32(OVL_LB))
-                        elif const_expr(PB):  # the buckets of rows [r_lo, r_hi)
+                        if const_expr(PB):  # the buckets of rows [r_lo, r_hi)
                             r_lo = cc * i32(rch)
                             r_hi = r_lo + dch_rows(L, expert, cc)
                             prev = i32(0)
@@ -1025,8 +1021,6 @@ def build_schedule(kc: KernelCtx) -> dict:
         if const_expr(SBXP):
             sbx_send(L, tid, a)
         else:  # the rest of the payload rounds later, by the senders (_dynq_passes_nw8)
-            if const_expr(SDMAD):
-                sd_rows(L, tid, a)
             dispatch_route_all(L, tid, a)
             a["hv"] = payload_hot0(L, tid, a) if const_expr(OWS) else i32(0)
             payload_send_ovl(
@@ -1103,7 +1097,6 @@ def build_schedule(kc: KernelCtx) -> dict:
             x_lo, g_hi = _xrange(L, nch, gx, a)
             g_lo = x_lo + i32(gpu.block_id("x")) // i32(N_XCD)
             g_st = (nblk - i32(1) - gx) // i32(N_XCD) + i32(1)
-            r_rpos = rsrc(a["mine"] + fx.Int64(a["off_rpos"]))
             for ei_ in range(g_lo, g_hi, g_st):
                 ei = i32(ei_)
                 expert, cc, ce, c0 = dch(L, ei)
@@ -1117,12 +1110,6 @@ def build_schedule(kc: KernelCtx) -> dict:
                     off = (ei * i32(rch) + r) * i32(4)
                     bst(idx, r_rowidx, off, 0, 0)
                     sk = idx // i32(TOPK)
-                    if const_expr(SDMAD):  # the source's compacted row (sd_rows)
-                        sk = (
-                            sk
-                            - sk % a["mtpr"]
-                            + fx.Int32(bld(r_rpos, sk * i32(4), 0, T.i32, AUX_PL))
-                        )
                     bst((r < R).select(sk, i32(0)), r_rowmap, off, 0, 0)
                 cbar(
                     L, tid

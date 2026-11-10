@@ -23,12 +23,6 @@ from .mega_moe_ep_config import (
     N_XCD,
     NCTA_MAX,
     SB_SHORT_I,
-    SD_BASE,
-    SD_DUM,
-    SD_INTS,
-    SD_QP,
-    SD_QS,
-    SDMA_ENV,
     ctrl_ints,
     ep_shape_supported,
     inter_rows,
@@ -263,33 +257,8 @@ class MegaMoeEPEngine:
         )
         self._flag = arena.reserve("flag", (FLAG_INTS,), torch.int32)
         self._out = arena.reserve("out", (self.mtpr, self.H), torch.bfloat16)
-        # AITER_MEGAMOE_EP_SDMA (large kernel): the payload rows / scales packed per owner
-        # (stage / sstage), the owner's compacted row of each received (source, token)
-        # (rpos), the target of a round without rows (sdum)
-        self.sdma = SDMA_ENV if self.mtpr > SB_MAX else 0
-        sd = bool(self.sdma)
-        self._stage = arena.reserve("stage", (tot if sd else 1, a_row), torch.uint8)
-        self._sstage = arena.reserve(
-            "sstage", (tot if sd else 1, self.H // 32), torch.uint8
-        )
-        self._rpos = arena.reserve("rpos", (tot if sd else 1,), torch.int32)
-        self._sdum = arena.reserve("sdum", (MAX_NPES * SD_DUM,), torch.uint8)
-        self._sdq = None
-        if sd:
-            from .sdma import SdmaQueues
-
-            self._sdq = SdmaQueues(group=group, device=self.device)
         arena.commit()
         self.arena = arena
-        self._sdst = torch.zeros(SD_INTS, dtype=torch.int32, device=self.device)
-        self._spos = torch.empty(
-            self.mtpr * MAX_NPES if sd else 1, dtype=torch.int32, device=self.device
-        )
-        if sd:  # this launch's signal base per (source, payload / scale queue)
-            sig = self._sdq.signals().cpu()
-            for s_ in range(self.world_size):
-                self._sdst[SD_BASE + 2 * s_] = int(sig[s_, SD_QP])
-                self._sdst[SD_BASE + 2 * s_ + 1] = int(sig[s_, SD_QS])
         self._recv.local.fill_(-1)  # SBX: scrubbed words (SBX_INV), never a launch's
         self.ctrl = torch.zeros(
             ctrl_ints(tot, self.K, self.epr), dtype=torch.int32, device=self.device
@@ -529,13 +498,6 @@ class MegaMoeEPEngine:
             self.epr,
             m,
             self.mtpr,
-            self._sdq.ptr if self._sdq is not None else 0,
-            self._sdst.data_ptr(),
-            self._spos.data_ptr(),
-            self._stage.offset,
-            self._sstage.offset,
-            self._rpos.offset,
-            self._sdum.offset,
             self.n_cta,
         )
 
